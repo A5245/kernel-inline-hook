@@ -8,19 +8,20 @@ This kernel module is a linux kernel inline hook module that supports different 
 
 1. Callback before calling -> call the original function -> callback after calling
 2. Callback before calling -> call the original function
+3. Callback before calling -> return calling function
 
 ## Limits
 
 Currently the module supports the following architectures:
 
-2. x86_64 (test passed)
-5. Currently supports functions with hook parameters of 8 or less
+1. x86_64 (test passed)
 
 ## Extra Features
 
 1. You can modify the parameters that call the original function in the previous callback
 2. You can get the parameter content of the original function in the previous callback function, verify it, etc.
 3. You can check the return value of the original function in the post callback function, and you can also modify the return value of the original function
+4. You can directly return not call the original function
 
 ## Build
 
@@ -38,52 +39,25 @@ Currently the module supports the following architectures:
 Example of hook function structure
 
 ```c
-//ordinary function
-static struct p_hook_struct p_generic_permission_hook={
-    .entry_fn=p_generic_permission_entry, //callback before calling
-    .ret_fn=p_generic_permission_ret, //callback after calling
-    .name="generic_permission", //function name
+int p_generic_permission_entry(void *, int);
+
+static struct p_hook_struct p_generic_permission_hook = {
+    .entry_fn = p_generic_permission_entry,
+    .name = "generic_permission",
 };
 
-//system call function
-static struct p_hook_struct p_generic_permission_hook={
-    .entry_fn=p_generic_permission_entry, //callback before calling
-    .ret_fn=p_generic_permission_ret, //callback after calling
-    .name="__x64_sys_read", //function name
-    .sys_call_number=__NR_read
-};
+int p_generic_permission_entry(void *node, const int mask) {
+  p_print_log("generic_permission node:%llx mask:%d\n", (uint64_t) node, mask);
+  return ((typeof(p_generic_permission_entry) *)
+              p_generic_permission_hook.stub->trampoline)(node, mask);
+}
 ```
 
-Example of callback function
+Example of install hook
 
 ```c
-//parameter1: The return address of the call to the original function
-//parameter2: Register condition when calling the original function
-int p_generic_permission_ret(unsigned long ret_addr,hk_regs * regs);
+p_install_hook(&p_generic_permission_hook);
 ```
-
-Example of hook function array information
-
-```c
-static const struct p_functions_hooks{
-    const char *name;
-    int (*install)(int p_isra);
-    void (*uninstall)(void);
-    int is_sys;
-}p_functions_hooks_array[]={
-    {
-        "generic_permission",
-        p_install_generic_permission_hook,
-        p_uninstall_generic_permission_hook,
-        0
-    },
-    {NULL,NULL,NULL,0}
-};
-```
-
-## Demo
-
-![demo](images/demo.gif)
 
 ## References
 
