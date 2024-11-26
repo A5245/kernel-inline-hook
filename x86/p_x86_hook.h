@@ -1,7 +1,7 @@
 #ifndef P_LKRG_X86_HOOK_H
 #define P_LKRG_X86_HOOK_H
 
-#if defined(CONFIG_X86)
+#if defined(CONFIG_X86_64)
 
 int inline_hook_install(void *arg);
 

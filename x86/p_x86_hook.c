@@ -1,256 +1,162 @@
-#include "../p_lkrg_main.h"
-
-#if defined(CONFIG_X86)
-
 #if defined(CONFIG_X86_64)
-#define KHOOK_STUB_FILE_NAME "x86_stub64.inc"
-#define KHOOK_STUB_FILE_NAME_ALL "x86_stub64_all.inc"
-#elif defined(CONFIG_X86)
-#define KHOOK_STUB_FILE_NAME "x86_stub.inc"
-#define KHOOK_STUB_FILE_NAME_ALL "x86_stub_all.inc"
-#endif
+#  include "p_x86_hook.h"
 
-static const char hook_stubemplate[] = {
-#include KHOOK_STUB_FILE_NAME
-};
+#  include <asm/insn.h>
+#  include <linux/vmalloc.h>
 
-static const char hook_stubemplate_all[] = {
-#include KHOOK_STUB_FILE_NAME_ALL
-};
+#  include "../p_config.h"
+#  include "../p_hook_target.h"
+#  include "../p_lkrg_main.h"
+#  include "../p_memory.h"
 
-#if defined(CONFIG_X86_32)
-unsigned char fix_parameters_limit_code[] = {
-	0x83,0xEC,0x14,
-	0x60,
-	0x8B,0x44,0x24,0x34,
-	0x89,0x44,0x24,0x20,
-	0xB9,0x04,0x00,0x00,0x00,
-	0x8D,0x74,0x24,0x3C,
-	0x8D,0x7C,0x24,0x24,
-	0xF3,0xA5,
-	0x61
-};
-#endif
+#  define TINY_SIZE 5
+#  define FULL_SIZE 12
 
-#if defined(CONFIG_X86_64)
-unsigned char fix_parameters_limit_code[] = {
-	0x48,0x83,0xEC,0x10,
-	0x50,
-	0x51,
-	0x56,
-	0x57,
-	0x48,0x8B,0x44,0x24,0x30,
-	0x48,0x89,0x44,0x24,0x20,
-	0xB9,0x02,0x00,0x00,0x00,
-	0x48,0x8D,0x74,0x24,0x40,
-	0x48,0x8D,0x7C,0x24,0x28,
-	0xF3,0x48,0xA5,
-	0x5F,
-	0x5E,
-	0x59,
-	0x58
-};
-#endif
+#  define MODE_TINY 0
+#  define MODE_FULL 1
 
-static inline int get_hook_length(const void *p) {
-	struct insn insn;
-	int x86_64 = 0;
-#ifdef CONFIG_X86_64
-	x86_64 = 1;
-#endif
-#if defined MAX_INSN_SIZE && (MAX_INSN_SIZE == 15) /* 3.19.7+ */
-	P_SYM(p_insn_init)(&insn, p, MAX_INSN_SIZE, x86_64);
-#else
-	P_SYM(p_insn_init)(&insn, p, x86_64);
-#endif
-	P_SYM(p_insn_get_length)(&insn);
-	return insn.length;
+static inline int get_insn_length(struct insn *insn, const void *p) {
+  int x86_64 = 0;
+#  ifdef CONFIG_X86_64
+  x86_64 = 1;
+#  endif
+#  if defined MAX_INSN_SIZE && (MAX_INSN_SIZE == 15) /* 3.19.7+ */
+  p_global_symbols.p_insn_init(insn, p, MAX_INSN_SIZE, x86_64);
+#  else
+  p_global_symbols.p_insn_init(&insn, p, x86_64);
+#  endif
+  p_global_symbols.p_insn_get_length(insn);
+  return insn->length;
 }
 
-static inline void x86_put_jmp(void *a, void *f, void *t)
-{
-	*((char *)(a + 0)) = 0xE9;
-	*(( int *)(a + 1)) = (long)(t - (f + 5));
+// static inline void build_trampoline(void *a, const void *from, const void *to,
+//                                     const size_t size) {
+//   if (size < FULL_SIZE) {
+//     uint8_t *ptr = a;
+//     ptr[0] = 0xE9;
+//     ((uint32_t *) (ptr + 1))[0] = to - (from + 5);
+//   } else {
+//   }
+// }
+
+static void set_trampoline(uint8_t *ptr, const int mode, const void *from,
+                           const void *to) {
+  if (mode == MODE_TINY) {
+    // jmp 0x0
+    ptr[0] = 0xE9;
+    ((uint32_t *) (ptr + 1))[0] = to - (from + 5);
+  } else {
+
+    // mov rax, 0x0
+    ((uint16_t *) ptr)[0] = 0xB848;
+    ((uint64_t *) (ptr + 2))[0] = (uint64_t) to;
+    // jmp rax
+    ((uint16_t *) (ptr + 10))[0] = 0xE0FF;
+  }
 }
 
-static inline void stub_fixup(unsigned char* stub, const void *entry,const void *ret){
-	
-	while (*(int *)stub != 0xcacacaca) stub++;
-	*(unsigned long *)stub = (unsigned long)entry;
-
-	if(ret==NULL) return;
-		
-	while(*(int*)stub!=0xcbcbcbcb) stub++;
-	*(unsigned long*)stub=(unsigned long)ret;
-		
+static inline void build_trampoline(struct p_hook_struct *hook_struct) {
+  hook_stub *stub = hook_struct->stub;
+  set_trampoline(stub->trampoline + stub->nbytes, hook_struct->trampoline_mode,
+                 stub->trampoline + stub->nbytes,
+                 hook_struct->addr + stub->nbytes);
 }
 
-#if defined(CONFIG_X86) && !defined(CONFIG_X86_64)
-static inline void stub_use_count_fixup(unsigned char* stub,const void *fix_addr)
-{
-	while (*(int *)stub != 0xabababab) stub++;
-	*(int*)stub = (int)fix_addr;
-
-	while (*(int *)stub != 0xacacacac) stub++;
-	*(int*)stub = (int)fix_addr;
-}
-#endif
-
-static inline int is_fix_offset(unsigned char *opcode){
-	if(opcode[0]==0xE8 || opcode[0]==0xE9){
-		return 1;
-	}
-#ifdef CONFIG_X86_64
-		//jmp [addr]
-	if(opcode[0]==0xFF && opcode[1]==0x25){
-		return 2;
-	}
-	//mov reg,[addr]
-	//mov [addr],reg
-	//lea reg,[addr]
-	if((opcode[0]==0x48 || opcode[0]==0x4C) && (opcode[1]==0x8B || opcode[1]==0x8D) && (opcode[2]&0x5)==0x5){
-		return 3;
-	}
-#endif
-	return -1;
+static inline int is_fix_offset(const uint8_t *opcode) {
+  if (opcode[0] == 0xE8 || opcode[0] == 0xE9) {
+    return 1;
+  }
+#  ifdef CONFIG_X86_64
+  //jmp [addr]
+  if (opcode[0] == 0xFF && opcode[1] == 0x25) {
+    return 2;
+  }
+  //mov reg,[addr]
+  //mov [addr],reg
+  //lea reg,[addr]
+  if ((opcode[0] == 0x48 || opcode[0] == 0x4C) &&
+      (opcode[1] == 0x8B || opcode[1] == 0x8D) && (opcode[2] & 0x5) == 0x5) {
+    return 3;
+  }
+#  endif
+  return -1;
 }
 
-static inline void fix_hook_offset(long func_addr,unsigned long new_addr,int offset,int insn_length,int size,int pos){
-	long target_addr=0;
-	int new_offset=0;
-	unsigned char *opcode=(unsigned char*)new_addr;
-	
-	target_addr=func_addr+size+offset+insn_length;
-	new_offset=target_addr-(new_addr+size+insn_length);
-	*(int*)&opcode[size+pos]=new_offset;
+static inline void fix_hook_offset(const uint8_t *func_addr, uint8_t *new_addr,
+                                   const int offset, const int insn_length,
+                                   const int pos) {
+  const uint8_t *target_addr = func_addr + offset + insn_length;
+  const size_t new_offset = target_addr - (new_addr + insn_length);
+  ((int *) (new_addr + pos))[0] = (int) new_offset;
 }
 
-//fix offset
-static inline void find_offset_code(struct p_hook_struct * p_current_hook_struct,unsigned long func_addr,unsigned long hook_length){
-	struct insn insn;
-	int x86_64 = 0;
-	int size=0;
-	int pos=0;
-	unsigned char *opcode;
+static inline void find_offset_code(const struct p_hook_struct *hook_struct,
+                                    const uint8_t *func_addr,
+                                    const unsigned long hook_length) {
+  struct insn insn;
+  int index = 0;
+  int pos = 0;
 
-#ifdef CONFIG_X86_64
-	x86_64 = 1;
-#endif
-	while(size<hook_length){
-#if defined MAX_INSN_SIZE && (MAX_INSN_SIZE == 15) /* 3.19.7+ */
-		P_SYM(p_insn_init)(&insn, (void*)(func_addr+size), MAX_INSN_SIZE, x86_64);
-#else
-		P_SYM(p_insn_init)(&insn, (void*)(func_addr+size), x86_64);
-#endif
-		P_SYM(p_insn_get_length)(&insn);
-		opcode=(unsigned char*)(func_addr+size);
-		if((pos=is_fix_offset(opcode))!=-1){
-			p_current_hook_struct->ori_offset=*(int*)&opcode[pos];
-			p_current_hook_struct->is_fix=true;
-			if(p_current_hook_struct->ret_fn==NULL){
-				fix_hook_offset(func_addr,(unsigned long)p_current_hook_struct->stub->orig,p_current_hook_struct->ori_offset,insn.length,size,pos);
-			}else{
-				fix_hook_offset(func_addr,(unsigned long)p_current_hook_struct->stub->orig+sizeof(fix_parameters_limit_code),p_current_hook_struct->ori_offset,insn.length,size,pos);
-			}
-
-			break;
-		}
-	
-		size+=insn.length;
-	}
+  while (index < hook_length) {
+    const uint8_t *opcode = func_addr + index;
+    const int size = get_insn_length(&insn, opcode);
+    if ((pos = is_fix_offset(opcode)) != -1) {
+      fix_hook_offset(opcode, hook_struct->stub->trampoline + index,
+                      ((int *) (opcode + pos))[0], size, pos);
+    }
+    index += size;
+  }
 }
 
-static inline void reduce_hook_offset(unsigned long func_addr,unsigned long hook_addr,int ori_offset,int hook_length){
-	int size=0;
-	int x86_64 = 0;
-	int pos=0;
-	char tmp_code[20]={0};
-	struct insn insn;
-	unsigned char *opcode;
+static void set_trampoline_size(struct p_hook_struct *hook_struct) {
+  hook_stub *stub = hook_struct->stub;
 
-#ifdef CONFIG_X86_64
-	x86_64 = 1;
-#endif
-	while(size<hook_length){
-#if defined MAX_INSN_SIZE && (MAX_INSN_SIZE == 15) /* 3.19.7+ */
-		P_SYM(p_insn_init)(&insn, (void*)(hook_addr+size), MAX_INSN_SIZE, x86_64);
-#else
-		P_SYM(p_insn_init)(&insn, (void*)(hook_addr+size), x86_64);
-#endif
-		P_SYM(p_insn_get_length)(&insn);
-		opcode=(unsigned char*)(hook_addr+size);
-		if((pos=is_fix_offset(opcode))!=-1){
-			break;
-		}
+  // jmp 0xFFFFFFFF (5)
+  size_t size = 5;
+  hook_struct->trampoline_mode = MODE_TINY;
+  const int64_t offset = stub->trampoline - hook_struct->addr;
+  if (offset < S32_MIN || offset > S32_MAX) {
+    // mov rax, 0xFFFFFFFFFFFFFFFF (10)
+    // jmp rax (2)
+    size = 12;
+    hook_struct->trampoline_mode = MODE_FULL;
+  }
 
-		size+=insn.length;
-	}
-
-	memcpy(tmp_code,(char*)hook_addr,hook_length);
-	*(int*)&tmp_code[size+pos]=ori_offset;
-	memcpy((char*)func_addr,tmp_code,hook_length);
+  struct insn insn;
+  while (stub->nbytes < size) {
+    stub->nbytes += get_insn_length(&insn, hook_struct->addr + stub->nbytes);
+  }
 }
 
-int inline_hook_install(void *arg)
-{
-    struct p_hook_struct * p_current_hook_struct=(struct p_hook_struct*)arg;
-	hook_stub * stub=p_current_hook_struct->stub;
-	
-	if(p_current_hook_struct->ret_fn==NULL){
-		memcpy(stub,hook_stubemplate,sizeof(hook_stubemplate));
-	}else{
-		memcpy(stub,hook_stubemplate_all,sizeof(hook_stubemplate_all));
-	}
-	
-	stub_fixup(stub->hook,p_current_hook_struct->entry_fn,p_current_hook_struct->ret_fn);
-#if defined(CONFIG_X86_32)
-	stub_use_count_fixup(stub->hook,&stub->use_count);
-#endif
+int inline_hook_install(void *arg) {
+  struct p_hook_struct *hook_struct = arg;
+  hook_stub *stub = hook_struct->stub;
 
-	while (stub->nbytes < 5)
-		stub->nbytes += get_hook_length(p_current_hook_struct->addr + stub->nbytes);
-	
-	if(p_current_hook_struct->ret_fn==NULL){
-		memcpy(stub->orig, p_current_hook_struct->addr, stub->nbytes);
-		x86_put_jmp(stub->orig + stub->nbytes, stub->orig + stub->nbytes, p_current_hook_struct->addr + stub->nbytes);
-	}else{
-		memcpy(stub->orig,fix_parameters_limit_code,sizeof(fix_parameters_limit_code));
-		memcpy(stub->orig + sizeof(fix_parameters_limit_code), p_current_hook_struct->addr, stub->nbytes);
-		x86_put_jmp(stub->orig + stub->nbytes + sizeof(fix_parameters_limit_code), stub->orig + stub->nbytes + sizeof(fix_parameters_limit_code), p_current_hook_struct->addr + stub->nbytes);
-	}
+  set_trampoline_size(hook_struct);
 
-	find_offset_code(p_current_hook_struct,(unsigned long)p_current_hook_struct->addr,stub->nbytes);	
-	kernel_write_enter();
-	x86_put_jmp(p_current_hook_struct->addr, p_current_hook_struct->addr, stub->hook);
-	kernel_write_leave();
-	
-	return 0;
+  memcpy(stub->backup, hook_struct->addr, stub->nbytes);
+  memcpy(stub->trampoline, hook_struct->addr, stub->nbytes);
+  build_trampoline(hook_struct);
+
+  find_offset_code(hook_struct, hook_struct->addr, stub->nbytes);
+  kernel_write_enter();
+  set_trampoline(hook_struct->addr, hook_struct->trampoline_mode,
+                 hook_struct->addr, hook_struct->entry_fn);
+  kernel_write_leave();
+
+  return add_hook_point(hook_struct->addr, hook_struct);
 }
 
+int inline_hook_uninstall(void *arg) {
+  struct p_hook_struct *hook_struct = arg;
+  hook_stub *stub = hook_struct->stub;
 
-int inline_hook_uninstall(void *arg)
-{
-    struct p_hook_struct * p_current_hook_struct=(struct p_hook_struct*)arg;
-	hook_stub * stub=p_current_hook_struct->stub;
-
-	kernel_write_enter();
-	if(p_current_hook_struct->is_fix){
-		if(p_current_hook_struct->ret_fn==NULL){
-			reduce_hook_offset((unsigned long)p_current_hook_struct->addr,(unsigned long)stub->orig,p_current_hook_struct->ori_offset,stub->nbytes);
-		}else{
-			reduce_hook_offset((unsigned long)p_current_hook_struct->addr,(unsigned long)stub->orig+sizeof(fix_parameters_limit_code),p_current_hook_struct->ori_offset,stub->nbytes);
-		}		
-	}else{
-		if(p_current_hook_struct->ret_fn==NULL){
-			memcpy(p_current_hook_struct->addr,stub->orig,stub->nbytes);
-		}else{
-			memcpy(p_current_hook_struct->addr,stub->orig+sizeof(fix_parameters_limit_code),stub->nbytes);
-		}
-		
-	}
-	kernel_write_leave();
-	return 0;
+  kernel_write_enter();
+  memcpy(hook_struct->addr, stub->backup, stub->nbytes);
+  vfree(stub);
+  hook_struct->stub = NULL;
+  kernel_write_leave();
+  return 0;
 }
-
 
 #endif

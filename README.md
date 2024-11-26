@@ -13,10 +13,7 @@ This kernel module is a linux kernel inline hook module that supports different 
 
 Currently the module supports the following architectures:
 
-1. x86 (test passed)
 2. x86_64 (test passed)
-3. Arm (arm mode test passed but thumb mode not tested)
-4. Arm64 (test passed)
 5. Currently supports functions with hook parameters of 8 or less
 
 ## Extra Features
